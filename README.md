@@ -69,10 +69,17 @@ much faster than uploading from Mongolia).** In the pod terminal:
 cd /workspace
 pip install b2
 b2 account authorize <B2_KEY_ID> <B2_APP_KEY>     # paste keys; never commit them
-b2 sync b2://<BUCKET_NAME>/<EXPORT_PREFIX> /workspace/data/wavs
-# then upload manifest.csv separately via RunPod's file upload button,
-# or b2 sync it the same way, into /workspace/data/
+mkdir -p /workspace/data/wavs/approved
+b2 sync b2://<BUCKET_NAME>/approved /workspace/data/wavs/approved
+# then upload manifest.csv via RunPod's file-upload button INTO /workspace/data/
+# so it lands exactly at /workspace/data/manifest.csv
 ```
+
+NOTE ON THE PATH: the manifest's `file` column holds full keys like
+`approved/MNKH_SPK01/MNKH_SPK01_RS_0006.wav`. Syncing the `approved` folder
+INTO `/workspace/data/wavs/approved` makes the on-disk path equal the key, so
+`--audio_dir /workspace/data/wavs` resolves every clip. Do not drop the
+`approved` part of the destination, or every clip will be reported missing.
 
 **Option B — upload from your computer** (if the export only exists locally):
 
