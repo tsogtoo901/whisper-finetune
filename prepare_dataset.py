@@ -52,7 +52,10 @@ MIN_CLIP_SECONDS = 0.5
 
 
 def load_and_validate_manifest(manifest_path: Path, audio_dir: Path) -> tuple[pd.DataFrame, dict]:
-    df = pd.read_csv(manifest_path, dtype=str)
+    # encoding="utf-8-sig" strips the BOM the export writes for Excel.
+    # Without it, the first column name arrives as "\ufefffile" and the
+    # required-columns check below fails on an otherwise-correct manifest.
+    df = pd.read_csv(manifest_path, dtype=str, encoding="utf-8-sig")
     required = {"file", "transcript", "speaker_id"}
     missing_cols = required - set(df.columns)
     if missing_cols:
@@ -94,34 +97,64 @@ def resample_one(args: tuple[str, str]) -> float:
 
 
 def split_by_speaker(df: pd.DataFrame, test_fraction: float, val_fraction: float,
-                     seed: int) -> pd.DataFrame:
-    """Assign every SPEAKER (not clip) to exactly one split, by duration."""
+                     seed: int, max_test_speaker_share: float) -> pd.DataFrame:
+    """Assign every SPEAKER (not clip) to exactly one split, by DURATION.
+
+    Splitting by duration (not by speaker count) already handles the common
+    case. But a highly skewed corpus — where one speaker (e.g. SPK30) holds a
+    large share of all audio — creates a second failure mode: if that speaker
+    lands in the test set, the "unheard speakers" WER becomes essentially
+    "how well does it do on that ONE voice", which is not a number a buyer
+    should trust. So we also cap how much any single speaker may contribute to
+    the test set: any speaker whose audio exceeds max_test_speaker_share of the
+    TARGET test duration is ineligible for test/validation and is placed in
+    train. The test set is then filled from the remaining speakers, keeping it
+    both duration-appropriate AND composed of many distinct voices.
+    """
     per_speaker = df.groupby("speaker_id")["duration"].sum()
-    total = per_speaker.sum()
-    speakers = list(per_speaker.index)
+    total = float(per_speaker.sum())
+    target_test = test_fraction * total
+    target_val = val_fraction * total
+
+    # Dominant speakers: too big to sit in test without dominating it.
+    cap = max_test_speaker_share * target_test
+    dominant = [s for s in per_speaker.index if per_speaker[s] > cap]
+    eligible = [s for s in per_speaker.index if per_speaker[s] <= cap]
+    if dominant:
+        print(f"  {len(dominant)} dominant speaker(s) forced into TRAIN "
+              f"(each exceeds {max_test_speaker_share:.0%} of the target test "
+              f"hours): {', '.join(sorted(dominant)[:8])}"
+              f"{' …' if len(dominant) > 8 else ''}")
+
     rng = random.Random(seed)
-    rng.shuffle(speakers)
+    rng.shuffle(eligible)
 
     test_speakers, val_speakers = set(), set()
     acc = 0.0
-    it = iter(speakers)
+    it = iter(eligible)
     for s in it:
         test_speakers.add(s)
         acc += per_speaker[s]
-        if acc >= test_fraction * total:
+        if acc >= target_test:
             break
+    achieved_test = acc
     acc = 0.0
     for s in it:
         val_speakers.add(s)
         acc += per_speaker[s]
-        if acc >= val_fraction * total:
+        if acc >= target_val:
             break
-    train_speakers = set(speakers) - test_speakers - val_speakers
+    train_speakers = set(per_speaker.index) - test_speakers - val_speakers
 
     if len(test_speakers) < 3:
         print("WARNING: fewer than 3 speakers in the test set. The WER number "
-              "will be statistically weak. Consider a larger test fraction or "
-              "more speakers before quoting it to buyers.")
+              "will be statistically weak. Add more speakers, or raise "
+              "--test_fraction, before quoting it to buyers.")
+    if achieved_test < 0.6 * target_test:
+        print(f"WARNING: test set is only {achieved_test / 3600:.1f}h vs a "
+              f"target of {target_test / 3600:.1f}h — not enough eligible "
+              f"(non-dominant) speakers to fill it. The number is still valid, "
+              f"just smaller than requested.")
     if not train_speakers:
         sys.exit("ERROR: no speakers left for training after the split. "
                  "Your dataset has too few speakers for these fractions.")
@@ -150,6 +183,9 @@ def main():
     ap.add_argument("--test_fraction", type=float, default=0.15)
     ap.add_argument("--val_fraction", type=float, default=0.05)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--max_test_speaker_share", type=float, default=0.34,
+                    help="Cap any one speaker's share of the target test hours; "
+                         "speakers above this go to train (skew protection)")
     ap.add_argument("--workers", type=int, default=os.cpu_count())
     args = ap.parse_args()
 
@@ -186,7 +222,8 @@ def main():
     df["duration"] = durs16  # authoritative durations post-resample
 
     print("== 4/5 Splitting by SPEAKER (integrity rule) ==")
-    df = split_by_speaker(df, args.test_fraction, args.val_fraction, args.seed)
+    df = split_by_speaker(df, args.test_fraction, args.val_fraction, args.seed,
+                          args.max_test_speaker_share)
 
     print("== 5/5 Building and saving HuggingFace dataset ==")
     splits = {}
