@@ -1,0 +1,12 @@
+# Install on the RunPod instance with:  pip install -r requirements.txt
+# NOTE: torch is NOT listed — the RunPod "PyTorch" template ships it
+# preinstalled with the matching CUDA build. Do not pip-install torch.
+transformers>=4.46,<5
+datasets>=2.19,<4.0
+accelerate>=0.30
+librosa>=0.10
+soundfile>=0.12
+jiwer>=3.0
+pandas>=2.0
+tensorboard
+tqdm
