@@ -10,3 +10,6 @@ jiwer>=3.0
 pandas>=2.0
 tensorboard
 tqdm
+# RunPod's PyTorch template enables HF "fast download" mode but doesn't ship
+# the package it needs; without this, downloading any Whisper model fails.
+hf_transfer
