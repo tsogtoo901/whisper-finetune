@@ -129,23 +129,47 @@ def split_by_speaker(df: pd.DataFrame, test_fraction: float, val_fraction: float
     rng = random.Random(seed)
     rng.shuffle(eligible)
 
+    # If the non-dominant pool can't fill BOTH targets (a heavily skewed
+    # corpus — e.g. five speakers holding 95% of the audio), share the pool
+    # between validation and test in the same ratio as the requested
+    # fractions, instead of giving everything to test and leaving validation
+    # empty. Validation is filled FIRST because it must never be empty
+    # (early stopping depends on it) and it is the smaller of the two.
+    eligible_total = float(sum(per_speaker[s] for s in eligible))
+    scarce = eligible_total < (target_test + target_val)
+    if scarce:
+        val_share = val_fraction / (test_fraction + val_fraction)
+        target_val_eff = val_share * eligible_total
+        print(f"  NOTE: non-dominant speakers total only {eligible_total / 3600:.1f}h, "
+              f"less than the {(target_test + target_val) / 3600:.1f}h needed for "
+              f"test+validation. Sharing that pool ~{1 - val_share:.0%} test / "
+              f"~{val_share:.0%} validation by speaker; all dominant speakers train.")
+    else:
+        target_val_eff = target_val
+
     test_speakers, val_speakers = set(), set()
-    acc = 0.0
     it = iter(eligible)
-    for s in it:
-        test_speakers.add(s)
-        acc += per_speaker[s]
-        if acc >= target_test:
-            break
-    achieved_test = acc
     acc = 0.0
     for s in it:
         val_speakers.add(s)
         acc += per_speaker[s]
-        if acc >= target_val:
+        if acc >= target_val_eff:
             break
+    acc = 0.0
+    for s in it:
+        test_speakers.add(s)
+        acc += per_speaker[s]
+        if not scarce and acc >= target_test:
+            break
+    achieved_test = acc
     train_speakers = set(per_speaker.index) - test_speakers - val_speakers
 
+    if not val_speakers or not test_speakers:
+        sys.exit("ERROR: could not form BOTH a validation and a test set from the "
+                 "non-dominant speakers — there are too few of them. Options: add "
+                 "more speakers to the corpus, or raise --max_test_speaker_share "
+                 "(with care: a larger share means one voice weighs more in the "
+                 "benchmark).")
     if len(test_speakers) < 3:
         print("WARNING: fewer than 3 speakers in the test set. The WER number "
               "will be statistically weak. Add more speakers, or raise "
@@ -226,6 +250,10 @@ def main():
                           args.max_test_speaker_share)
 
     print("== 5/5 Building and saving HuggingFace dataset ==")
+    for name in ["train", "validation", "test"]:
+        if (df["split"] == name).sum() == 0:
+            sys.exit(f"ERROR: the '{name}' split is empty — refusing to save. "
+                     f"See the split messages above.")
     splits = {}
     for name in ["train", "validation", "test"]:
         part = df[df["split"] == name]
