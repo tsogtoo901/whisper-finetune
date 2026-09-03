@@ -149,6 +149,9 @@ def main():
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.learning_rate,
         gradient_checkpointing=True,
+        # Non-reentrant checkpointing is required on recent PyTorch/transformers;
+        # the old reentrant default raises "backward through the graph a second time".
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         fp16=torch.cuda.is_available(),
         predict_with_generate=True,
         generation_max_length=225,
