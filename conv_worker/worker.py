@@ -40,7 +40,9 @@ TARGET_SR   = 16000
 # ───────────────────────────── portal API ──────────────────────────────────────
 def api(path, method="GET", body=None):
     req = urllib.request.Request(BASE + path, method=method,
-                                 headers={"X-API-Key": API_KEY, "Content-Type": "application/json"},
+                                 # Cloudflare blocks Python's default "Python-urllib" client; a named agent passes.
+                                 headers={"X-API-Key": API_KEY, "Content-Type": "application/json",
+                                          "User-Agent": "MNKH-conv-worker/1.0"},
                                  data=(json.dumps(body).encode() if body is not None else None))
     with urllib.request.urlopen(req, timeout=120) as r:
         return json.loads(r.read().decode() or "{}")
@@ -133,8 +135,12 @@ class Transcriber:
         device = 0 if torch.cuda.is_available() else -1
         dtype = torch.float16 if device == 0 else torch.float32
         print(f"[worker] loading {model_dir} on {'cuda' if device == 0 else 'cpu'} …", flush=True)
-        self.pipe = pipeline("automatic-speech-recognition", model=model_dir, device=device, torch_dtype=dtype,
-                             chunk_length_s=30, stride_length_s=(4, 2))
+        try:
+            self.pipe = pipeline("automatic-speech-recognition", model=model_dir, device=device, dtype=dtype,
+                                 chunk_length_s=30, stride_length_s=(4, 2))
+        except TypeError:   # transformers < 4.56 uses the old name
+            self.pipe = pipeline("automatic-speech-recognition", model=model_dir, device=device, torch_dtype=dtype,
+                                 chunk_length_s=30, stride_length_s=(4, 2))
         self.gen = {"language": LANGUAGE, "task": "transcribe", "num_beams": 1, "no_repeat_ngram_size": 4}
 
     def segments(self, x16k, sr=TARGET_SR):
