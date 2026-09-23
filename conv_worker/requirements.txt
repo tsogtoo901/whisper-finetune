@@ -1,0 +1,6 @@
+# GPU pod images already ship torch; these are the rest.
+transformers>=4.40
+accelerate
+numpy
+scipy
+boto3
