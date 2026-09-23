@@ -152,6 +152,7 @@ class Transcriber:
                 continue
             res = self.pipe({"raw": clip, "sampling_rate": sr}, return_timestamps=True, generate_kwargs=self.gen)
             chunks = res.get("chunks") or [{"timestamp": (0.0, e - s), "text": res.get("text", "")}]
+            n_before = len(out)
             for c in chunks:
                 text = (c.get("text") or "").strip()
                 if not text:
@@ -162,6 +163,10 @@ class Transcriber:
                 if t1 <= t0:
                     t1 = t0 + 0.2
                 out.append((s + t0, s + t1, text))
+            if len(out) == n_before:
+                # The model produced nothing for a region that clearly contains speech: emit an
+                # empty row so the editor still hears it (the portal marks it as a gap to fill).
+                out.append((s, e, ""))
         return out
 
 # ───────────────────────────── assembly ────────────────────────────────────────
