@@ -141,6 +141,15 @@ class Transcriber:
         except TypeError:   # transformers < 4.56 uses the old name
             self.pipe = pipeline("automatic-speech-recognition", model=model_dir, device=device, torch_dtype=dtype,
                                  chunk_length_s=30, stride_length_s=(4, 2))
+        # Newer transformers (4.5x) can crash in Whisper's timestamp processor when the model's
+        # generation config stores eos/pad ids as a LIST ("slice indices must be integers");
+        # older ones (<4.45) cannot read this model's tokenizer file at all. Normalise the ids
+        # to plain ints so the current 4.x line works.
+        gc = self.pipe.model.generation_config
+        for k in ("eos_token_id", "pad_token_id", "decoder_start_token_id", "bos_token_id"):
+            v = getattr(gc, k, None)
+            if isinstance(v, (list, tuple)) and v:
+                setattr(gc, k, int(v[0]))
         self.gen = {"language": LANGUAGE, "task": "transcribe", "num_beams": 1, "no_repeat_ngram_size": 4}
 
     def segments(self, x16k, sr=TARGET_SR):

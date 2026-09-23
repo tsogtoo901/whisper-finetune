@@ -1,5 +1,5 @@
 # GPU pod images already ship torch; these are the rest.
-transformers>=4.40,<5
+transformers>=4.50,<5
 accelerate
 numpy
 scipy
