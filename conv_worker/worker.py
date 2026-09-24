@@ -93,38 +93,73 @@ def load_wav_16k(path):
             x = x[:m].reshape(-1, f).mean(axis=1).astype(np.float32)
     return x
 
-def voiced_regions(x, sr=TARGET_SR, frame_ms=20, margin_db=12.0, pad_s=0.25, gap_s=0.6, min_s=0.4):
-    """Energy VAD: regions where the track is clearly above its own quiet floor.
-    On a dual-channel recording the partner's turns are near-silent on this track,
-    and Whisper hallucinates on silence — so we only transcribe voiced regions."""
+def frame_db(x, sr=TARGET_SR, frame_ms=20):
+    """Per-frame level in dB for a 16 kHz float signal."""
     import numpy as np
     n = int(sr * frame_ms / 1000)
     m = (len(x) // n) * n
     if m == 0:
-        return []
+        return np.zeros(0)
     fr = x[:m].reshape(-1, n)
-    rms = np.sqrt((fr * fr).mean(axis=1)) + 1e-9
-    db = 20 * np.log10(rms)
+    return 20 * np.log10(np.sqrt((fr * fr).mean(axis=1)) + 1e-9)
+
+def voiced_regions(x, sr=TARGET_SR, frame_ms=20, margin_db=12.0, pad_s=0.25, gap_s=0.6, min_s=0.4,
+                   x_other=None, other_shift_s=0.0, own_db=6.0, max_s=20.0):
+    """Regions of MY speech on this track's own timeline.
+    A frame counts when (1) it is clearly above my track's own quiet floor and (2) my track is at
+    least as loud as my partner's track at the same moment (x_other, whose timeline is mine
+    shifted by other_shift_s). The partner's voice leaking through my earphones is quieter on
+    my track than on theirs, so it is skipped; genuine overlap (both loud) is kept on both.
+    Regions are merged across pauses shorter than gap_s, padded, and regions longer than max_s
+    are split at their quietest internal dip. Rows are cut ONLY here — never inside a region —
+    so a boundary can never fall in the middle of a word."""
+    import numpy as np
+    db = frame_db(x, sr, frame_ms)
+    if len(db) == 0:
+        return []
+    fs = frame_ms / 1000.0
     floor = np.percentile(db, 10); thr = floor + margin_db
     on = db > thr
+    if x_other is not None:
+        dbo = frame_db(x_other, sr, frame_ms)
+        shift = int(round(other_shift_s / fs))      # my frame i ↔ other frame i + shift
+        other = np.full(len(db), -1e9)
+        lo, hi = max(0, -shift), min(len(db), len(dbo) - shift)
+        if hi > lo:
+            other[lo:hi] = dbo[lo + shift:hi + shift]
+        on = on & (db >= other - own_db)
     regions = []; start = None; last_on = None
     for i, v in enumerate(on):
-        t = i * frame_ms / 1000.0
+        t = i * fs
         if v:
             if start is None: start = t
             last_on = t
         elif start is not None and (t - last_on) > gap_s:
-            regions.append((start, last_on + frame_ms / 1000.0)); start = None
+            regions.append((start, last_on + fs)); start = None
     if start is not None:
-        regions.append((start, last_on + frame_ms / 1000.0))
+        regions.append((start, last_on + fs))
+    total = len(x) / sr
+    merged = []
+    for a, b in regions:
+        a, b = max(0.0, a - pad_s), min(total, b + pad_s)
+        if b - a < min_s:
+            continue
+        if merged and a <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
     out = []
-    for s, e in regions:
-        s, e = max(0.0, s - pad_s), min(len(x) / sr, e + pad_s)
-        if e - s >= min_s:
-            if out and s <= out[-1][1]:
-                out[-1] = (out[-1][0], max(out[-1][1], e))
-            else:
-                out.append((s, e))
+    stack = list(reversed(merged))
+    while stack:
+        a, b = stack.pop()
+        if b - a <= max_s:
+            out.append((a, b)); continue
+        L = b - a; lo, hi = int((a + 0.3 * L) / fs), int((b - 0.3 * L) / fs); mid = (lo + hi) / 2.0
+        if hi - lo < 2:
+            out.append((a, b)); continue
+        k = min(range(lo, hi), key=lambda i: (round(float(db[i]), 1), abs(i - mid)))
+        cut = (k + 0.5) * fs
+        stack.append([cut, b]); stack.append([a, cut])
     return out
 
 # ───────────────────────────── ASR ─────────────────────────────────────────────
@@ -162,30 +197,22 @@ class Transcriber:
                     "eos_token_id": int(eos), "pad_token_id": int(pad)}
         print(f"[worker] generation ids: eos={eos} pad={pad}", flush=True)
 
-    def segments(self, x16k, sr=TARGET_SR):
-        """[(start_sec, end_sec, text)] on the track's own timeline."""
+    def segments(self, x16k, sr=TARGET_SR, x_other=None, other_shift_s=0.0):
+        """[(start_sec, end_sec, text)] on the track's own timeline: exactly one row per
+        speech region (regions are cut only at pauses, ≤ 20 s), so no boundary can land inside
+        a word. Empty text is kept as an empty row so the editor still hears the audio."""
         out = []
-        for s, e in voiced_regions(x16k, sr):
+        for s, e in voiced_regions(x16k, sr, x_other=x_other, other_shift_s=other_shift_s):
             clip = x16k[int(s * sr):int(e * sr)]
             if len(clip) < sr // 4:
                 continue
-            res = self.pipe({"raw": clip, "sampling_rate": sr}, return_timestamps=True, generate_kwargs=self.gen)
-            chunks = res.get("chunks") or [{"timestamp": (0.0, e - s), "text": res.get("text", "")}]
-            n_before = len(out)
-            for c in chunks:
-                text = (c.get("text") or "").strip()
-                if not text:
-                    continue
-                t0, t1 = c.get("timestamp") or (0.0, None)
-                t0 = float(t0 or 0.0)
-                t1 = float(t1) if t1 is not None else min(e - s, t0 + 10.0)
-                if t1 <= t0:
-                    t1 = t0 + 0.2
-                out.append((s + t0, s + t1, text))
-            if len(out) == n_before:
-                # The model produced nothing for a region that clearly contains speech: emit an
-                # empty row so the editor still hears it (the portal marks it as a gap to fill).
-                out.append((s, e, ""))
+            try:
+                res = self.pipe({"raw": clip, "sampling_rate": sr}, return_timestamps=False, generate_kwargs=self.gen)
+                text = (res.get("text") or "").strip()
+            except Exception as ex:
+                print(f"[worker] region {s:.1f}-{e:.1f}s failed ({ex}); leaving empty", flush=True)
+                text = ""
+            out.append((s, e, text))
         return out
 
 # ───────────────────────────── assembly ────────────────────────────────────────
@@ -218,16 +245,24 @@ def offsets_for(tracks):
 def process(session, asr, s3):
     code = session["session_id"]
     print(f"[worker] {code}: {len(session['tracks'])} tracks", flush=True)
+    off = offsets_for(session["tracks"])
+    off_s = {ch: v / 1000.0 for ch, v in off.items()}
     seg_by_channel = {}
     with tempfile.TemporaryDirectory() as tmp:
+        audio = {}
         for t in session["tracks"]:
             local = os.path.join(tmp, f"{t['channel']}.wav")
             s3.download_file(B2_BUCKET, t["b2_key"], local)
-            x = load_wav_16k(local)
-            segs = asr.segments(x)
-            print(f"[worker] {code} {t['channel']}: {len(segs)} segments from {len(x)/TARGET_SR/60:.1f} min", flush=True)
-            seg_by_channel[t["channel"]] = segs
-    off = offsets_for(session["tracks"])
+            audio[t["channel"]] = load_wav_16k(local)
+        for ch, x in audio.items():
+            other_ch = "B" if ch == "A" else "A"
+            x_other = audio.get(other_ch)
+            # my file time t ↔ session time t + off[ch] ↔ other's file time t + off[ch] - off[other]
+            shift = off_s.get(ch, 0.0) - off_s.get(other_ch, 0.0)
+            segs = asr.segments(x, x_other=x_other, other_shift_s=shift)
+            n_empty = sum(1 for _, _, t in segs if not t)
+            print(f"[worker] {code} {ch}: {len(segs)} regions ({n_empty} without text) from {len(x)/TARGET_SR/60:.1f} min", flush=True)
+            seg_by_channel[ch] = segs
     utts = to_utterances(seg_by_channel, off)
     if not utts:
         raise RuntimeError("no utterances produced (silent tracks?)")
