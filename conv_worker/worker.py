@@ -145,12 +145,22 @@ class Transcriber:
         # generation config stores eos/pad ids as a LIST ("slice indices must be integers");
         # older ones (<4.45) cannot read this model's tokenizer file at all. Normalise the ids
         # to plain ints so the current 4.x line works.
-        gc = self.pipe.model.generation_config
-        for k in ("eos_token_id", "pad_token_id", "decoder_start_token_id", "bos_token_id"):
-            v = getattr(gc, k, None)
-            if isinstance(v, (list, tuple)) and v:
-                setattr(gc, k, int(v[0]))
-        self.gen = {"language": LANGUAGE, "task": "transcribe", "num_beams": 1, "no_repeat_ngram_size": 4}
+        # The pipeline keeps its OWN copy of the generation config and passes that to generate(),
+        # so fix both copies, and additionally force plain-int ids through generate_kwargs
+        # (those override whatever config generate() ends up with).
+        def _as_int(v):
+            return int(v[0]) if isinstance(v, (list, tuple)) and v else v
+        for gc in (getattr(self.pipe.model, "generation_config", None), getattr(self.pipe, "generation_config", None)):
+            if gc is None: continue
+            for k in ("eos_token_id", "pad_token_id", "decoder_start_token_id", "bos_token_id"):
+                v = getattr(gc, k, None)
+                if isinstance(v, (list, tuple)): setattr(gc, k, _as_int(v))
+        tok = self.pipe.tokenizer
+        eos = _as_int(getattr(self.pipe.model.generation_config, "eos_token_id", None)) or tok.eos_token_id
+        pad = _as_int(getattr(self.pipe.model.generation_config, "pad_token_id", None)) or tok.pad_token_id or eos
+        self.gen = {"language": LANGUAGE, "task": "transcribe", "num_beams": 1, "no_repeat_ngram_size": 4,
+                    "eos_token_id": int(eos), "pad_token_id": int(pad)}
+        print(f"[worker] generation ids: eos={eos} pad={pad}", flush=True)
 
     def segments(self, x16k, sr=TARGET_SR):
         """[(start_sec, end_sec, text)] on the track's own timeline."""
