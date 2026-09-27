@@ -5,10 +5,15 @@ Step 1 of the pipeline: turn the raw export into a training-ready dataset.
 INPUT (the "manifest contract")
 -------------------------------
   --audio_dir   folder containing the exported WAV clips (48kHz/16-bit)
-  --manifest    a CSV file with EXACTLY these three columns:
+  --manifest    a CSV file with these three columns (required):
                     file        clip filename, relative to --audio_dir
                     transcript  verbatim Mongolian transcript
                     speaker_id  stable ID of the speaker (any string)
+                and, optionally, three more (the conversational export writes them):
+                    start_sec   segment start inside `file`, in seconds (blank = whole file)
+                    end_sec     segment end inside `file`, in seconds   (blank = whole file)
+                    source      "rs" (read speech, whole clip) or "conv" (a segment of a
+                                conversation track). Several rows may point at ONE file.
 
 WHAT IT DOES
 ------------
@@ -20,7 +25,12 @@ WHAT IT DOES
   4. Splits BY SPEAKER: every speaker lands wholly in exactly one of
      train / validation / test. Test speakers appear in ZERO training
      clips. This is the integrity rule from the spec — it is enforced
-     here in code and asserted before saving.
+     here in code and asserted before saving. A conversation segment
+     carries its own speaker (each speaker is on their own track), so
+     the rule holds for conversational data unchanged.
+  4b. Optionally repeats conversational segments in TRAIN (--conv_repeat N)
+     so a small conversational share still moves the model. Test and
+     validation are never repeated.
   5. Saves a HuggingFace DatasetDict to disk and writes
      split_report.json with exact hours / clips / speakers per split.
 
@@ -49,6 +59,7 @@ from tqdm import tqdm
 TARGET_SR = 16000
 MAX_CLIP_SECONDS = 30.0
 MIN_CLIP_SECONDS = 0.5
+OPTIONAL_COLS = ("start_sec", "end_sec", "source")
 
 
 def load_and_validate_manifest(manifest_path: Path, audio_dir: Path) -> tuple[pd.DataFrame, dict]:
@@ -70,6 +81,17 @@ def load_and_validate_manifest(manifest_path: Path, audio_dir: Path) -> tuple[pd
     df = df[(df["transcript"] != "") & (df["speaker_id"] != "")]
     stats["dropped_empty_fields"] = stats["rows_in_manifest"] - len(df)
 
+    # optional segment columns (conversational rows); whole-file rows leave them blank
+    for col in OPTIONAL_COLS:
+        if col not in df.columns:
+            df[col] = ""
+    df["start_sec"] = pd.to_numeric(df["start_sec"], errors="coerce")
+    df["end_sec"] = pd.to_numeric(df["end_sec"], errors="coerce")
+    df["source"] = df["source"].fillna("").astype(str).str.strip().str.lower().replace("", "rs")
+    df["is_segment"] = df["start_sec"].notna() & df["end_sec"].notna()
+    bad_seg = df["is_segment"] & (df["end_sec"] <= df["start_sec"])
+    stats["dropped_bad_segment_times"] = int(bad_seg.sum())
+    df = df[~bad_seg]
     df["path"] = df["file"].apply(lambda f: str(audio_dir / f))
     exists_mask = df["path"].apply(os.path.isfile)
     stats["dropped_missing_files"] = int((~exists_mask).sum())
@@ -88,10 +110,20 @@ def read_duration(path: str) -> float:
         return -1.0  # unreadable → will be dropped
 
 
-def resample_one(args: tuple[str, str]) -> float:
-    """Resample one clip to 16kHz mono. Returns duration in seconds."""
-    src, dst = args
-    audio, _ = librosa.load(src, sr=TARGET_SR, mono=True)
+def resample_one(args: tuple[str, str, object, object]) -> float:
+    """Resample one clip — or one SEGMENT of a long track — to 16kHz mono.
+    Returns duration in seconds. Segments are read with start/stop frames so a
+    25-minute conversation track is never loaded whole for each of its rows."""
+    src, dst, start, end = args
+    if start is None:
+        audio, _ = librosa.load(src, sr=TARGET_SR, mono=True)
+    else:
+        info = sf.info(src)
+        a, b = int(float(start) * info.samplerate), int(float(end) * info.samplerate)
+        audio, sr = sf.read(src, start=a, stop=min(b, info.frames), dtype="float32", always_2d=True)
+        audio = audio.mean(axis=1)
+        if sr != TARGET_SR:
+            audio = librosa.resample(audio, orig_sr=sr, target_sr=TARGET_SR)
     sf.write(dst, audio, TARGET_SR, subtype="PCM_16")
     return len(audio) / TARGET_SR
 
@@ -211,6 +243,10 @@ def main():
                     help="Cap any one speaker's share of the target test hours; "
                          "speakers above this go to train (skew protection)")
     ap.add_argument("--workers", type=int, default=os.cpu_count())
+    ap.add_argument("--conv_repeat", type=int, default=1,
+                    help="Repeat each conversational (source=conv) TRAIN segment this many "
+                         "times so a small conversational share still influences training "
+                         "(1 = no repetition; validation/test are never repeated)")
     args = ap.parse_args()
 
     audio_dir = Path(args.audio_dir)
@@ -222,10 +258,18 @@ def main():
     df, stats = load_and_validate_manifest(Path(args.manifest), audio_dir)
 
     print("== 2/5 Reading clip durations ==")
+    whole = ~df["is_segment"]
+    durations = [0.0] * len(df)
     with ProcessPoolExecutor(max_workers=args.workers) as ex:
-        durations = list(tqdm(ex.map(read_duration, df["path"], chunksize=64),
-                              total=len(df)))
+        whole_paths = df.loc[whole, "path"].tolist()
+        whole_durs = list(tqdm(ex.map(read_duration, whole_paths, chunksize=64), total=len(whole_paths)))
+    it = iter(whole_durs)
+    for i, seg in enumerate(df["is_segment"].tolist()):
+        durations[i] = (float(df["end_sec"].iat[i]) - float(df["start_sec"].iat[i])) if seg else next(it)
     df["duration"] = durations
+    n_seg = int(df["is_segment"].sum())
+    if n_seg:
+        print(f"  {n_seg} conversational segment(s) across {df.loc[df['is_segment'], 'file'].nunique()} track(s)")
 
     unreadable = df["duration"] < 0
     too_long = df["duration"] > MAX_CLIP_SECONDS
@@ -239,7 +283,8 @@ def main():
 
     print("== 3/5 Resampling to 16kHz mono (this is the slow step) ==")
     df["path16"] = [str(resampled_dir / f"{i:07d}.wav") for i in range(len(df))]
-    jobs = list(zip(df["path"], df["path16"]))
+    jobs = [(p, q, (s if seg else None), (e if seg else None))
+            for p, q, seg, s, e in zip(df["path"], df["path16"], df["is_segment"], df["start_sec"], df["end_sec"])]
     with ProcessPoolExecutor(max_workers=args.workers) as ex:
         durs16 = list(tqdm(ex.map(resample_one, jobs, chunksize=16),
                            total=len(jobs)))
@@ -257,10 +302,17 @@ def main():
     splits = {}
     for name in ["train", "validation", "test"]:
         part = df[df["split"] == name]
+        if name == "train" and args.conv_repeat > 1:
+            conv = part[part["source"] == "conv"]
+            if len(conv):
+                part = pd.concat([part] + [conv] * (args.conv_repeat - 1), ignore_index=True)
+                print(f"  train: conversational segments repeated x{args.conv_repeat} "
+                      f"({len(conv)} → {len(conv) * args.conv_repeat} rows)")
         ds = Dataset.from_dict({
             "audio": part["path16"].tolist(),
             "sentence": part["transcript"].tolist(),
             "speaker_id": part["speaker_id"].tolist(),
+            "source": part["source"].tolist(),
         }).cast_column("audio", Audio(sampling_rate=TARGET_SR))
         splits[name] = ds
     DatasetDict(splits).save_to_disk(str(out_dir / "dataset"))
@@ -277,7 +329,11 @@ def main():
             "clips": int(len(part)),
             "hours": round(part["duration"].sum() / 3600, 2),
             "unique_speakers": int(part["speaker_id"].nunique()),
+            "by_source": {src: {"clips": int(len(g)), "hours": round(g["duration"].sum() / 3600, 2),
+                                "unique_speakers": int(g["speaker_id"].nunique())}
+                          for src, g in part.groupby("source")},
         }
+    report["conv_repeat_in_train"] = args.conv_repeat
     with open(out_dir / "split_report.json", "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
 
