@@ -5,7 +5,11 @@ FROM runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404
 
 WORKDIR /app
 COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt runpod
+# --ignore-installed cryptography: the base image ships a system (debian) cryptography with no
+# RECORD file, so pip cannot uninstall it when runpod pulls a newer one. Installing over it
+# (not uninstalling) is safe here and avoids "uninstall-no-record-file".
+RUN pip install --no-cache-dir --ignore-installed cryptography \
+ && pip install --no-cache-dir -r /app/requirements.txt runpod
 COPY worker.py handler.py /app/
 
 ENV MODEL_DIR=/runpod-volume/model \
